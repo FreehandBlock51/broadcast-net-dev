@@ -1,6 +1,7 @@
 - Add network functions to bcnet.h:
     send_to()
     recv()
+- fix recv_content() so it uses recvfrom() correctly
 
 - Add encryption functions to auth.h:
     encrypt()
