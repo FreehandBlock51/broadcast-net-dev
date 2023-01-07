@@ -27,6 +27,11 @@
 #define BCN_CONST "This is a test constant"
 #define BCN_CONST_LEN sizeof(BCN_CONST)
 
+const struct bcn_keypair {
+  bcn_key_t public;
+  bcn_key_t private;
+} BCN_DEVICE_KEY;
+
 // the type of a BNP packet
 enum PacketType
 {
@@ -38,13 +43,14 @@ enum PacketType
 // the header of a BNP packet
 struct bcn_packet_header {
   char constant[BCN_CONST_LEN]; // the constant
+  bcn_key_t pkey; // the sender's public key
   enum PacketType type; // the packet's type
   uint8_t order; // unused unless packet is of type STREAM; if it is, then the amount of STREAM packets sent before this one
   uint32_t content_length; // the length of the content, in bytes
 };
 
 // populates a BNP packet
-int bcn_populate_packet(char *packet, size_t packetsize, enum PacketType type, uint8_t order, uint32_t content_length, char* content) {
+int bcn_populate_packet(char *packet, size_t packetsize, bcn_key_t pkey, enum PacketType type, uint8_t order, uint32_t content_length, char* content) {
   if (packetsize < sizeof(struct bcn_packet_header) + (content_length * 8)) { // buffer for packet is too small
     errno = EINVAL;
     return -1;
@@ -53,6 +59,7 @@ int bcn_populate_packet(char *packet, size_t packetsize, enum PacketType type, u
   struct bcn_packet_header *header = (struct bcn_packet_header*)packet;
   *header = (struct bcn_packet_header){
     .constant = BCN_CONST,
+    .pkey = pkey,
     .type = type,
     .order = order,
     .content_length = content_length
@@ -98,7 +105,7 @@ int send_content(bcn_socket_t* bcn_socket, char* buffer, int32_t bufSize, struct
     free(encryptedpacket); // free both in case one was allocated
     return -1; // errno set by malloc
   }
-  if (!bcn_populate_packet(packet, packetSize, CONTENT, 0, bufSize / 8, buffer)) {
+  if (!bcn_populate_packet(packet, packetSize, BCN_DEVICE_KEY.public, CONTENT, 0, bufSize / 8, buffer)) {
     free(packet);
     free(encryptedpacket);
     return -1; // errno set by bcn_populate_packet
@@ -130,7 +137,12 @@ int send_content(bcn_socket_t* bcn_socket, char* buffer, int32_t bufSize, struct
   return 0;
 }
 
-int recv_content(bcn_socket_t* bcn_socket, char* buffer, int32_t bufsize, struct sockaddr_bcn fromaddr) {
+int recv_content(bcn_socket_t* bcn_socket, char* buffer, int32_t bufsize, struct sockaddr_bcn* fromaddr, size_t fromaddrlen) {
+  if (fromaddrlen != sizeof(struct sockaddr_bcn)) { // fromaddr doesn't point to a BCN sockaddr
+    errno = EINVAL;
+    return -1;
+  }
+
   if (bcn_socket->streamPacketsSent > 0) { // stream sockets sending content packets will lose their connection to the stream
     bcn_socket->streamPacketsSent = 0;
     memset(bcn_socket->convKey, 0, sizeof(bcn_key_t));
@@ -140,14 +152,7 @@ int recv_content(bcn_socket_t* bcn_socket, char* buffer, int32_t bufsize, struct
   int result = 0;
 
   // recieve the packet
-  struct sockaddr_in tempaddr = (struct sockaddr_in){
-    .sin_family = AF_INET,
-    .sin_addr = {
-      .s_addr = fromaddr.range.full << 16
-    },
-    .sin_port = fromaddr.port,
-    .sin_zero = {0,0,0,0,0,0,0,0}
-  };
+  struct sockaddr_in tempaddr = (struct sockaddr_in){0};
 
   size_t packetsize = bufsize + sizeof(struct bcn_packet_header);
   char *encryptedpacket = malloc(packetsize);
@@ -168,7 +173,7 @@ int recv_content(bcn_socket_t* bcn_socket, char* buffer, int32_t bufsize, struct
     if (result < sizeof(struct bcn_packet_header)) { // packet is smaller than our header size, and therefore can't be ours
       continue;
     }
-    if (!(result = rsa_decrypt(fromaddr.key, encryptedpacket, packetsize, decryptedpacket, packetsize))) { // decryption error
+    if (!(result = rsa_decrypt(BCN_DEVICE_KEY.private, encryptedpacket, packetsize, decryptedpacket, packetsize))) { // decryption error
       break; // cleanup is done after the loop, & errno is set by rsa_decrypt
     }
     struct bcn_packet_header *header = (struct bcn_packet_header*)decryptedpacket;
@@ -188,6 +193,14 @@ int recv_content(bcn_socket_t* bcn_socket, char* buffer, int32_t bufsize, struct
       errno = EMSGSIZE; // packet might be bigger than the buffer
       result = 1; // not an error, just a warning
     }
+
+    // get the sender's address
+    *fromaddr = (struct sockaddr_bcn){
+      .key = header->pkey,
+      .port = tempaddr.sin_port,
+      .range.full = tempaddr.sin_addr.s_addr >> 16
+    };
+
     break; // result will either be 0 or errno will be set.  Either way, cleanup is after the loop
   }
   
@@ -212,7 +225,7 @@ int connect_to(bcn_socket_t *bcn_socket, struct sockaddr_bcn target) {
     free(encryptedPacket); // free both buffers incase one malloc was successful
     return -1; // errno is set by malloc
   }
-  if (!bcn_populate_packet(packet, packetSize, CONTENT, 0, sizeof(bcn_key_t) / 8, bcn_socket->convKey)) {
+  if (!bcn_populate_packet(packet, packetSize, BCN_DEVICE_KEY.public, CONTENT, 0, sizeof(bcn_key_t) / 8, bcn_socket->convKey)) {
     free(packet);
     free(encryptedPacket);
     return -1; // errno set by bcn_populate_packet
